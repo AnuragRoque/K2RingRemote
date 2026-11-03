@@ -117,3 +117,7 @@
 2026-11-03 18:22:53.392    pointer device: type=3 product='' match=3
 2026-11-03 18:22:53.393  Ring touches map to screen area 1920,-364 - 4480,1076 (ring's own touch mapping)
 2026-11-03 18:23:51.395  Start with Windows: ON
+2026-11-03 18:43:12.453  ==== K2 Ring Remote started ====
+2026-11-03 18:43:12.456  Moved the old K2Remote.ini button settings into the Media profile
+2026-11-03 18:43:12.472  Settings loaded: 3 profiles, active = Media
+2026-11-03 18:43:12.494  Ring touches map to screen area 1920,-364 - 4480,1076 (ring's own touch mapping)
