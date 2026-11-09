@@ -1,0 +1,17 @@
+# Build output - published as a GitHub Release, not committed
+K2Remote.exe
+*.pdb
+
+# Files the app creates next to the exe at run time
+K2Remote.log
+K2Remote.settings.ini
+K2Remote.ini
+*.tmp
+
+# Editors and OS
+.vs/
+.vscode/
+*.suo
+*.user
+Thumbs.db
+desktop.ini
