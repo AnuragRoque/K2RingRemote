@@ -14,6 +14,7 @@ using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -282,7 +283,9 @@ namespace K2RingRemote
             sb.AppendLine("; K2 Ring Remote settings - easiest to change in the Settings window (double-click the tray icon).");
             sb.AppendLine("; Actions: a key or shortcut such as VolumeUp, PlayPause, F, Ctrl+Shift+S, Alt+Tab;");
             sb.AppendLine(";          Mouse:LeftClick / RightClick / MiddleClick / ScrollUp / ScrollDown; NextProfile; None");
-            sb.AppendLine("; HoldMode: Repeat (repeat while held), Once, KeyDown (keep the key pressed while held)");
+            sb.AppendLine(";          Add \" x3\" to send it 3 times per press, e.g. Down x3 or Mouse:LeftClick x2");
+            sb.AppendLine("; HoldMode: Repeat (repeat while held), Once, KeyDown (keep the key pressed while held, repeating like a real key)");
+            sb.AppendLine("; Holding Left / Right / Center makes the ring itself do Previous / Next / Play-Pause; the app can't change those.");
             sb.AppendLine();
             sb.AppendLine("[General]");
             sb.AppendLine("ActiveProfile=" + Active);
@@ -345,16 +348,21 @@ namespace K2RingRemote
 
     sealed class ActionSpec
     {
+        public const int MaxTimes = 50;
+
         public ActionKind Kind;
         public ushort Vk;
         public ushort[] Mods = new ushort[0];
         public string Mouse = "";
+        public int Times = 1;   // one ring press sends the action this many times (spec suffix " x3")
 
         public static readonly string[] MouseActions = { "LeftClick", "RightClick", "MiddleClick", "ScrollUp", "ScrollDown" };
         static readonly string[] MouseFriendly = { "Left click", "Right click", "Middle click", "Scroll up", "Scroll down" };
         static readonly ushort[] ModifierOrder = { 0x11, 0x10, 0x12, 0x5B };   // Ctrl, Shift, Alt, Win
+        static readonly Regex TimesSuffix = new Regex(@"^(.*\S)\s+[xX](\d{1,3})$");
 
         public bool IsVolume { get { return Kind == ActionKind.Keys && Mods.Length == 0 && (Vk == 0xAF || Vk == 0xAE); } }
+        public bool CanRepeat { get { return Kind == ActionKind.Keys || Kind == ActionKind.Mouse; } }
 
         public static ActionSpec Parse(string spec)
         {
@@ -364,9 +372,33 @@ namespace K2RingRemote
 
         public static ActionSpec Parse(string spec, out string err)
         {
+            string s = (spec ?? "").Trim();
+            int times = 1;
+            Match m = TimesSuffix.Match(s);
+            if (m.Success)
+            {
+                s = m.Groups[1].Value;
+                times = Math.Max(1, Math.Min(MaxTimes, int.Parse(m.Groups[2].Value)));
+            }
+            ActionSpec a = ParseOne(s, out err);
+            if (a.CanRepeat) a.Times = times;
+            return a;
+        }
+
+        // The same spec, sent 'times' times per press.
+        public static string WithTimes(string spec, int times)
+        {
+            string s = (spec ?? "").Trim();
+            Match m = TimesSuffix.Match(s);
+            if (m.Success) s = m.Groups[1].Value;
+            times = Math.Max(1, Math.Min(MaxTimes, times));
+            return times > 1 ? s + " x" + times : s;
+        }
+
+        static ActionSpec ParseOne(string s, out string err)
+        {
             err = null;
             var a = new ActionSpec();
-            string s = (spec ?? "").Trim();
             if (s.Length == 0 || s.Equals("None", StringComparison.OrdinalIgnoreCase)) return a;
             if (s.Equals("NextProfile", StringComparison.OrdinalIgnoreCase)) { a.Kind = ActionKind.NextProfile; return a; }
             if (s.StartsWith("Mouse:", StringComparison.OrdinalIgnoreCase))
@@ -396,6 +428,12 @@ namespace K2RingRemote
         }
 
         public string ToFriendly()
+        {
+            return BaseFriendly() + (Times > 1 ? " ×" + Times : "");
+        }
+
+        // The action's name without the repeat count.
+        public string BaseFriendly()
         {
             switch (Kind)
             {
@@ -531,28 +569,34 @@ namespace K2RingRemote
 
     static class Sender
     {
-        public static void Tap(ActionSpec a)
+        public const int Signature = 0x4B32;   // dwExtraInfo on everything this app types or clicks
+
+        // Press and release, 'count' times, in one batch so nothing else can slip in between.
+        public static void Tap(ActionSpec a, int count)
         {
-            if (a.Kind == ActionKind.Keys)
+            var l = new List<Native.INPUT>();
+            for (int n = 0; n < Math.Max(1, count); n++)
             {
-                var l = new List<Native.INPUT>();
-                foreach (ushort m in a.Mods) l.Add(Key(m, false));
-                l.Add(Key(a.Vk, false));
-                l.Add(Key(a.Vk, true));
-                for (int i = a.Mods.Length - 1; i >= 0; i--) l.Add(Key(a.Mods[i], true));
-                Send(l.ToArray());
-            }
-            else if (a.Kind == ActionKind.Mouse)
-            {
-                switch (a.Mouse)
+                if (a.Kind == ActionKind.Keys)
                 {
-                    case "LeftClick": Send(MouseInput(0x0002, 0), MouseInput(0x0004, 0)); break;
-                    case "RightClick": Send(MouseInput(0x0008, 0), MouseInput(0x0010, 0)); break;
-                    case "MiddleClick": Send(MouseInput(0x0020, 0), MouseInput(0x0040, 0)); break;
-                    case "ScrollUp": Send(MouseInput(0x0800, 120)); break;
-                    case "ScrollDown": Send(MouseInput(0x0800, -120)); break;
+                    foreach (ushort m in a.Mods) l.Add(Key(m, false));
+                    l.Add(Key(a.Vk, false));
+                    l.Add(Key(a.Vk, true));
+                    for (int i = a.Mods.Length - 1; i >= 0; i--) l.Add(Key(a.Mods[i], true));
+                }
+                else if (a.Kind == ActionKind.Mouse)
+                {
+                    switch (a.Mouse)
+                    {
+                        case "LeftClick": l.Add(MouseInput(0x0002, 0)); l.Add(MouseInput(0x0004, 0)); break;
+                        case "RightClick": l.Add(MouseInput(0x0008, 0)); l.Add(MouseInput(0x0010, 0)); break;
+                        case "MiddleClick": l.Add(MouseInput(0x0020, 0)); l.Add(MouseInput(0x0040, 0)); break;
+                        case "ScrollUp": l.Add(MouseInput(0x0800, 120)); break;
+                        case "ScrollDown": l.Add(MouseInput(0x0800, -120)); break;
+                    }
                 }
             }
+            if (l.Count > 0) Send(l.ToArray());
         }
 
         // Press and keep holding (for "Keep key held down").
@@ -572,7 +616,7 @@ namespace K2RingRemote
                     case "LeftClick": Send(MouseInput(0x0002, 0)); break;
                     case "RightClick": Send(MouseInput(0x0008, 0)); break;
                     case "MiddleClick": Send(MouseInput(0x0020, 0)); break;
-                    default: Tap(a); break;
+                    default: Tap(a, 1); break;
                 }
             }
         }
@@ -603,7 +647,7 @@ namespace K2RingRemote
             inp.u.ki.wVk = vk;
             inp.u.ki.wScan = (ushort)Native.MapVirtualKey(vk, 0);
             inp.u.ki.dwFlags = (KeyNames.IsExtended(vk) ? 1u : 0u) | (up ? 2u : 0u);
-            inp.u.ki.dwExtraInfo = new IntPtr(0x4B32);
+            inp.u.ki.dwExtraInfo = new IntPtr(Signature);
             return inp;
         }
 
@@ -612,7 +656,7 @@ namespace K2RingRemote
             var inp = new Native.INPUT { type = 0 };
             inp.u.mi.dwFlags = flags;
             inp.u.mi.mouseData = unchecked((uint)data);
-            inp.u.mi.dwExtraInfo = new IntPtr(0x4B32);
+            inp.u.mi.dwExtraInfo = new IntPtr(Signature);
             return inp;
         }
 
@@ -620,6 +664,88 @@ namespace K2RingRemote
         {
             Native.SendInput((uint)arr.Length, arr, Marshal.SizeOf(typeof(Native.INPUT)));
         }
+    }
+
+    // =====================================================================  speaker volume (Windows Core Audio)
+
+    // Reads and sets the default speaker's volume, so the app can undo the ring's own Volume Up / Down.
+    sealed class AudioVolume
+    {
+        IAudioEndpointVolume ep;
+        DateTime gotAt = DateTime.MinValue;
+        Guid ctx = Guid.NewGuid();
+
+        IAudioEndpointVolume Get()
+        {
+            if (ep != null && (DateTime.Now - gotAt).TotalSeconds < 5) return ep;   // re-check now and then: the default device can change
+            gotAt = DateTime.Now;
+            try
+            {
+                var en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
+                IMMDevice dev;
+                if (en.GetDefaultAudioEndpoint(0 /*eRender*/, 0 /*eConsole*/, out dev) != 0 || dev == null) { ep = null; return null; }
+                Guid iid = typeof(IAudioEndpointVolume).GUID;
+                object o;
+                ep = dev.Activate(ref iid, 0x17 /*CLSCTX_ALL*/, IntPtr.Zero, out o) == 0 ? o as IAudioEndpointVolume : null;
+            }
+            catch { ep = null; }
+            return ep;
+        }
+
+        public bool Read(out float level, out bool mute)
+        {
+            level = 0; mute = false;
+            try
+            {
+                IAudioEndpointVolume v = Get();
+                return v != null && v.GetMasterVolumeLevelScalar(out level) == 0 && v.GetMute(out mute) == 0;
+            }
+            catch { ep = null; return false; }
+        }
+
+        public void SetLevel(float level)
+        {
+            try { IAudioEndpointVolume v = Get(); if (v != null) v.SetMasterVolumeLevelScalar(level, ref ctx); } catch { ep = null; }
+        }
+
+        public void SetMute(bool mute)
+        {
+            try { IAudioEndpointVolume v = Get(); if (v != null) v.SetMute(mute, ref ctx); } catch { ep = null; }
+        }
+    }
+
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    class MMDeviceEnumeratorCom { }
+
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator
+    {
+        [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
+        [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
+    }
+
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice
+    {
+        [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object iface);
+    }
+
+    [ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioEndpointVolume
+    {
+        [PreserveSig] int RegisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int UnregisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int GetChannelCount(out uint count);
+        [PreserveSig] int SetMasterVolumeLevel(float levelDb, ref Guid ctx);
+        [PreserveSig] int SetMasterVolumeLevelScalar(float level, ref Guid ctx);
+        [PreserveSig] int GetMasterVolumeLevel(out float levelDb);
+        [PreserveSig] int GetMasterVolumeLevelScalar(out float level);
+        [PreserveSig] int SetChannelVolumeLevel(uint channel, float levelDb, ref Guid ctx);
+        [PreserveSig] int SetChannelVolumeLevelScalar(uint channel, float level, ref Guid ctx);
+        [PreserveSig] int GetChannelVolumeLevel(uint channel, out float levelDb);
+        [PreserveSig] int GetChannelVolumeLevelScalar(uint channel, out float level);
+        [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, ref Guid ctx);
+        [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
     }
 
     // =====================================================================  engine (ring input -> actions)
@@ -678,15 +804,37 @@ namespace K2RingRemote
         DateTime nextRepeat;
         int holdCount;
 
+        // touch details for the log
+        bool sawHover, hoverFirst, firstConfident = true;
+        DateTime lastTouchLeak = DateTime.MinValue;
+        Native.POINT leakPt;
+
+        // The ring's second HID part sends real media keys. From a capture of this ring: a touch-pad button kept pressed
+        // sends no swipe, only a media key - Up: Volume Up repeated about every 0.35 s, Down: Volume Down repeated,
+        // Left / Right / Center: Previous Track / Next Track / Play-Pause once. The camera button sends one Volume Up
+        // (ignored by the app). Windows' HID service acts on these itself (they never pass the keyboard hook), so they
+        // can't be blocked; for the volume keys the app puts the volume back and runs the user's Hold action instead.
+        const int VolUpDecideMs = 500;       // another Volume Up this soon = Up is held; none = camera button, ignored
+        const int MediaHoldEndMs = 600;      // an Up / Down hold ends when the ring's repeats stop for this long
+        string mediaHold;                    // "Up" or "Down" while the ring reports that button held
+        DateTime lastMediaRepeat;
+        bool volUpPending;                   // a Volume Up came in: the camera button, or the start of an Up hold?
+        DateTime volUpPendingAt;
+        readonly AudioVolume volume = new AudioVolume();
+        bool guardOn, guardMute, sampleMute;    // volume guard: puts the volume back after the ring's own volume keys
+        float guardLevel, sampleLevel;
+        DateTime guardUntil, sampleAt = DateTime.MinValue;
+        int guardFixes;
+        static readonly uint ourPid = (uint)Process.GetCurrentProcess().Id;
+
         public Engine(Settings s)
         {
             settings = s;
             IntPtr unused = invoker.Handle;   // so other threads can BeginInvoke onto this one
 
             inputWin = new InputWindow(this);
-            var rid = new[] { new Native.RAWINPUTDEVICE { usUsagePage = 0x0D, usUsage = 0x04, dwFlags = Native.RIDEV_INPUTSINK, hwndTarget = inputWin.Handle } };
-            if (!Native.RegisterRawInputDevices(rid, 1, (uint)Marshal.SizeOf(typeof(Native.RAWINPUTDEVICE))))
-                Log.Write("ERROR: could not listen for touch input (error " + Marshal.GetLastWin32Error() + ")");
+            Listen(0x0D, 0x04, "touch input");
+            Listen(0x0C, 0x01, "media keys");
 
             UpdateDisplayMapping(true);
             foreach (var p in DefaultSpots) AddSpot(p[0], p[1]);
@@ -698,6 +846,13 @@ namespace K2RingRemote
             timer = new System.Windows.Forms.Timer { Interval = 15 };
             timer.Tick += OnTick;
             timer.Start();
+        }
+
+        void Listen(ushort page, ushort usage, string what)
+        {
+            var rid = new[] { new Native.RAWINPUTDEVICE { usUsagePage = page, usUsage = usage, dwFlags = Native.RIDEV_INPUTSINK, hwndTarget = inputWin.Handle } };
+            if (!Native.RegisterRawInputDevices(rid, 1, (uint)Marshal.SizeOf(typeof(Native.RAWINPUTDEVICE))))
+                Log.Write("ERROR: could not listen for " + what + " (error " + Marshal.GetLastWin32Error() + ")");
         }
 
         // ---------------- called from the UI thread
@@ -726,6 +881,8 @@ namespace K2RingRemote
                 if (enabled == on) return;
                 StopHold();
                 pending = null;
+                mediaHold = null;
+                volUpPending = false;
                 enabled = on;
                 foreach (var a in absorbers) { if (on) a.Show(); else a.Hide(); }
                 Log.Write(on ? "Remote turned ON" : "Remote turned OFF (ring acts as a touch screen again)");
@@ -747,14 +904,15 @@ namespace K2RingRemote
                 var h = (Native.RAWINPUTHEADER)Marshal.PtrToStructure(buf, typeof(Native.RAWINPUTHEADER));
                 if (h.dwType != Native.RIM_TYPEHID) return;
                 HidDev d = GetDev(h.hDevice);
-                if (!d.IsRing || !d.HasXY) return;
+                if (!d.IsRing || !(d.HasXY || d.IsMedia)) return;
                 int sizeHid = Marshal.ReadInt32(buf, (int)hdr);
                 int count = Marshal.ReadInt32(buf, (int)hdr + 4);
                 for (int i = 0; i < count; i++)
                 {
                     var rep = new byte[sizeHid];
                     Marshal.Copy(buf + (int)hdr + 8 + i * sizeHid, rep, 0, sizeHid);
-                    Decode(d, rep);
+                    if (d.IsMedia) DecodeMedia(d, rep);
+                    else Decode(d, rep);
                 }
             }
             catch (Exception ex) { Log.Write("input error: " + ex.Message); }
@@ -777,6 +935,12 @@ namespace K2RingRemote
             Native.HIDP_CAPS caps;
             Native.HidP_GetCaps(d.Pp, out caps);
             d.MaxUsages = Math.Max(1u, Native.HidP_MaxUsageListLength(Native.HidP_Input, 0, d.Pp));
+            if (caps.UsagePage == 0x0C)
+            {
+                d.IsMedia = true;
+                Log.Write("Ring media-key part detected (camera button / long presses)");
+                return d;
+            }
             ushort n = caps.NumberInputValueCaps;
             if (n > 0)
             {
@@ -801,25 +965,27 @@ namespace K2RingRemote
         {
             uint n = d.MaxUsages;
             var list = new ushort[n * 2];
-            bool tip = false, inRange = false;
+            bool tip = false, inRange = false, confident = false;
             if (Native.HidP_GetUsagesEx(Native.HidP_Input, 0, list, ref n, d.Pp, rep, (uint)rep.Length) == Native.HIDP_STATUS_SUCCESS)
                 for (int i = 0; i < n; i++)
                 {
                     if (list[i * 2 + 1] == 0x0D && list[i * 2] == 0x42) tip = true;
                     if (list[i * 2 + 1] == 0x0D && list[i * 2] == 0x32) inRange = true;
+                    if (list[i * 2 + 1] == 0x0D && list[i * 2] == 0x47) confident = true;
                 }
             uint x, y;
             if (Native.HidP_GetUsageValue(Native.HidP_Input, 0x01, d.LinkXY, 0x30, out x, d.Pp, rep, (uint)rep.Length) != Native.HIDP_STATUS_SUCCESS) return;
             if (Native.HidP_GetUsageValue(Native.HidP_Input, 0x01, d.LinkXY, 0x31, out y, d.Pp, rep, (uint)rep.Length) != Native.HIDP_STATUS_SUCCESS) return;
-            OnRingReport(tip, inRange, (int)x, (int)y);
+            OnRingReport(tip, inRange, confident, (int)x, (int)y);
         }
 
-        void OnRingReport(bool tip, bool inRange, int x, int y)
+        void OnRingReport(bool tip, bool inRange, bool confident, int x, int y)
         {
             lastReport = DateTime.Now;
             // The first point where the "finger" appears (hover or touch) is where Windows aims the touch: block it.
             if ((tip || inRange) && !hovering) { hovering = true; LearnSpot(x, y); }
-            else if (!tip && !inRange) hovering = false;
+            else if (!tip && !inRange) { hovering = false; if (!down) sawHover = false; }
+            if (inRange && !tip && !down) sawHover = true;
 
             if (tip)
             {
@@ -827,10 +993,202 @@ namespace K2RingRemote
                 {
                     down = true; holdChecked = false;
                     sx = lx = x; sy = ly = y; downAt = lastReport; reports = 1;
+                    hoverFirst = sawHover; firstConfident = confident;
                 }
                 else { lx = x; ly = y; reports++; }
             }
             else if (down) TouchEnded();
+        }
+
+        // ---------------- the ring's media keys (camera button, long presses)
+
+        void DecodeMedia(HidDev d, byte[] rep)
+        {
+            uint n = Math.Max(4u, d.MaxUsages);
+            var list = new ushort[n * 2];
+            var now = new List<ushort>();
+            if (Native.HidP_GetUsagesEx(Native.HidP_Input, 0, list, ref n, d.Pp, rep, (uint)rep.Length) == Native.HIDP_STATUS_SUCCESS)
+                for (int i = 0; i < n; i++)
+                    if (list[i * 2 + 1] == 0x0C && list[i * 2] != 0 && !now.Contains(list[i * 2])) now.Add(list[i * 2]);
+            string raw = BitConverter.ToString(rep);
+            foreach (ushort u in new List<ushort>(d.MediaDown))
+                if (!now.Contains(u)) { d.MediaDown.Remove(u); OnRingKey(u, false, raw); }
+            foreach (ushort u in now)
+                if (!d.MediaDown.Contains(u)) { d.MediaDown.Add(u); OnRingKey(u, true, raw); }
+        }
+
+        void OnRingKey(ushort usage, bool isDown, string raw)
+        {
+            if (!isDown) return;          // the ring always lets go of its media keys at once: only the press matters
+            DateTime now = DateTime.Now;
+            string name = MediaName(usage);
+            Log.Write(string.Format("  ring key: {0}   [report {1}]", name, raw));
+            if (!enabled) return;
+
+            if (usage != 0xE9 && volUpPending) SingleVolumeUp();
+            switch (usage)
+            {
+                case 0xE9:   // Volume Up: Up held (then it repeats), or the camera button (just once)
+                    if (mediaHold == "Up") RingRepeat("Up", now);
+                    else if (volUpPending && (now - volUpPendingAt).TotalMilliseconds <= VolUpDecideMs) { volUpPending = false; BeginMediaHold("Up", now); }
+                    else
+                    {
+                        if (volUpPending) SingleVolumeUp();
+                        volUpPending = true;
+                        volUpPendingAt = now;
+                        if (!IsVolumeAction(settings.ActiveProfile["Up"].Hold)) GuardVolume(now, true);
+                    }
+                    break;
+                case 0xEA:   // Volume Down: Down held
+                    if (mediaHold == "Down") RingRepeat("Down", now);
+                    else BeginMediaHold("Down", now);
+                    break;
+                case 0xB6: RingLongPress("Left", name); break;
+                case 0xB5: RingLongPress("Right", name); break;
+                case 0xCD: RingLongPress("Center", name); break;
+                default: Report("Ring", "key", name + " (unknown to the app - Windows handles it)"); break;
+            }
+        }
+
+        // A Volume Up that wasn't followed by another one: the camera button (or a very short hold). Ignored.
+        void SingleVolumeUp()
+        {
+            volUpPending = false;
+            Log.Write("  (single Volume Up - camera button or a very short hold: ignored)");
+        }
+
+        void BeginMediaHold(string button, DateTime now)
+        {
+            EndMediaHold();
+            mediaHold = button;
+            lastMediaRepeat = now;
+            ButtonBinding b = settings.ActiveProfile[button];
+            ActionSpec a = ActionSpec.Parse(b.Hold);
+            if (IsRingsOwn(button, b.Hold)) { StopGuard(); Report(button, "hold", a.BaseFriendly() + " (the ring does this itself)"); return; }
+            if (IsVolumeAction(b.Hold)) StopGuard(); else GuardVolume(now, button == "Up");
+            if (a.Kind == ActionKind.None) { Report(button, "hold", "nothing (no hold action set)"); return; }
+            FlushPending();
+            StopHold();
+            StartHold(button, a, b.Mode);
+        }
+
+        // The ring repeats Volume Up / Down while Up / Down is held.
+        void RingRepeat(string button, DateTime now)
+        {
+            lastMediaRepeat = now;
+            if (!IsVolumeAction(settings.ActiveProfile[button].Hold)) GuardVolume(now, button == "Up");
+        }
+
+        void EndMediaHold()
+        {
+            if (mediaHold == null) return;
+            string b = mediaHold;
+            mediaHold = null;
+            if (holding && holdButton == b) StopHold();
+        }
+
+        void RingLongPress(string button, string name)
+        {
+            EndMediaHold();
+            Report(button, "hold", name + " (built into the ring - Windows does it, the app can't change it)");
+        }
+
+        static bool IsVolumeAction(string spec)
+        {
+            ActionSpec a = ActionSpec.Parse(spec);
+            return a.Kind == ActionKind.Keys && a.Mods.Length == 0 && (a.Vk == 0xAF || a.Vk == 0xAE || a.Vk == 0xAD);
+        }
+
+        // The action is exactly what the ring sends anyway (Volume Up for Up, Volume Down for Down).
+        static bool IsRingsOwn(string button, string spec)
+        {
+            ActionSpec a = ActionSpec.Parse(spec);
+            ushort own = button == "Down" ? (ushort)0xAE : (ushort)0xAF;
+            return a.Kind == ActionKind.Keys && a.Mods.Length == 0 && a.Vk == own && a.Times == 1;
+        }
+
+        // ---------------- volume guard: put the volume back after the ring's own Volume Up / Down
+
+        void GuardVolume(DateTime now, bool up)
+        {
+            if (!guardOn)
+            {
+                float cur;
+                bool mute;
+                if (!volume.Read(out cur, out mute)) return;
+                // If Windows already applied the ring's key, use the sample from just before it.
+                bool landed = (now - sampleAt).TotalMilliseconds < 300 &&
+                              (up ? (cur > sampleLevel + 0.001f || mute != sampleMute) : cur < sampleLevel - 0.001f);
+                guardLevel = landed ? sampleLevel : cur;
+                guardMute = landed ? sampleMute : mute;
+                guardOn = true;
+                guardFixes = 0;
+            }
+            guardUntil = now.AddMilliseconds(MediaHoldEndMs);
+        }
+
+        void StopGuard()
+        {
+            guardOn = false;
+            sampleAt = DateTime.MinValue;
+        }
+
+        // Every tick: while guarding, put the volume back; otherwise keep a recent sample of it.
+        void TickVolume(DateTime now)
+        {
+            if (guardOn)
+            {
+                float cur;
+                bool mute;
+                if (volume.Read(out cur, out mute))
+                {
+                    bool fixedIt = false;
+                    if (Math.Abs(cur - guardLevel) > 0.001f) { volume.SetLevel(guardLevel); fixedIt = true; }
+                    if (mute != guardMute) { volume.SetMute(guardMute); fixedIt = true; }
+                    if (fixedIt) guardFixes++;
+                }
+                if (now > guardUntil)
+                {
+                    if (guardFixes > 0) Log.Write("  put the volume back to " + (int)Math.Round(guardLevel * 100) + "%");
+                    StopGuard();
+                }
+            }
+            else if (enabled && (now - sampleAt).TotalMilliseconds >= 100)
+            {
+                if (volume.Read(out sampleLevel, out sampleMute)) sampleAt = now;
+            }
+        }
+
+        static string MediaName(ushort u)
+        {
+            switch (u)
+            {
+                case 0xE9: return "Volume Up";
+                case 0xEA: return "Volume Down";
+                case 0xE2: return "Mute";
+                case 0xCD: return "Play/Pause";
+                case 0xB5: return "Next Track";
+                case 0xB6: return "Previous Track";
+                case 0xB7: return "Stop";
+                case 0x30: return "Power";
+                case 0x40: return "Menu";
+                case 0x183: return "Media Player";
+                case 0x196: return "Web Browser";
+                case 0x223: return "Home";
+                case 0x224: return "Back";
+                case 0x22D: return "Zoom In";
+                case 0x22E: return "Zoom Out";
+            }
+            return "media key 0x" + u.ToString("X3");
+        }
+
+        static bool OurWindowInFront()
+        {
+            IntPtr h = Native.GetForegroundWindow();
+            if (h == IntPtr.Zero) return false;
+            uint pid;
+            Native.GetWindowThreadProcessId(h, out pid);
+            return pid == ourPid;
         }
 
         string Classify()
@@ -847,12 +1205,17 @@ namespace K2RingRemote
             DateTime now = DateTime.Now;
             string button = Classify();
             DateTime since = lastTouchEnd > downAt.AddMilliseconds(-500) ? lastTouchEnd : downAt.AddMilliseconds(-500);
-            string touch = lastAbsorbed > since ? "blocked" : lastPointerSeen > since ? "hover only (blocked)" : "not seen by blockers";
+            string touch = lastAbsorbed > since ? "blocked"
+                         : lastTouchLeak > since ? string.Format("REACHED THE SCREEN at {0},{1}", leakPt.X, leakPt.Y)
+                         : lastPointerSeen > since ? "hover only (blocked)"
+                         : "not seen by blockers";
             lastTouchEnd = now;
-            Log.Write(string.Format("  ring gesture: {0,-6} dx={1} dy={2} lasted {3} ms, {4} reports, touch {5}",
-                button, lx - sx, ly - sy, (int)(now - downAt).TotalMilliseconds, reports, touch));
+            Log.Write(string.Format("  ring gesture: {0,-6} from {1},{2} dx={3} dy={4} lasted {5} ms, {6} reports{7}{8}, touch {9}",
+                button, sx, sy, lx - sx, ly - sy, (int)(now - downAt).TotalMilliseconds, reports,
+                hoverFirst ? ", hover first" : "", firstConfident ? "" : ", low confidence", touch));
+            sawHover = false;
 
-            if (holding) { StopHold(); return; }
+            if (holding && holdButton != mediaHold) { StopHold(); return; }   // end of a touch hold (not one the ring's media keys run)
             if (!enabled) { Report(button, "press", "ignored (remote is off)"); return; }
             OnPress(button, downAt);
         }
@@ -903,20 +1266,28 @@ namespace K2RingRemote
                 case ActionKind.None: return "nothing";
                 case ActionKind.NextProfile: return SwitchToNextProfile();
             }
-            int times = a.IsVolume ? settings.VolumeSteps : 1;
-            for (int i = 0; i < times; i++) Sender.Tap(a);
-            return a.ToFriendly() + (times > 1 ? " x" + times : "");
+            int times = a.Times * (a.IsVolume ? settings.VolumeSteps : 1);
+            string what = a.BaseFriendly() + (times > 1 ? " x" + times : "");
+            // Keys sent now would land in our own Settings window (and change its dropdowns), so don't send them.
+            if (OurWindowInFront()) return what + "  (not sent: the Settings window is in front - click another window to use the ring)";
+            Sender.Tap(a, times);
+            return what;
         }
 
         void StartHold(string button, ActionSpec a, HoldMode mode)
         {
+            if (a.Kind != ActionKind.NextProfile && OurWindowInFront())
+            {
+                Report(button, "hold", a.BaseFriendly() + "  (not sent: the Settings window is in front)");
+                return;
+            }
             if (a.Kind == ActionKind.NextProfile) mode = HoldMode.Once;
             if (mode == HoldMode.KeyDown && !(a.Kind == ActionKind.Keys || (a.Kind == ActionKind.Mouse && a.Mouse.EndsWith("Click"))))
                 mode = HoldMode.Repeat;
             holding = true; holdButton = button; holdAction = a; holdMode = mode; holdCount = 0;
             string what;
             if (mode == HoldMode.Once) what = Fire(a);
-            else if (mode == HoldMode.KeyDown) { Sender.Down(a); what = a.ToFriendly() + " (held down)"; }
+            else if (mode == HoldMode.KeyDown) { Sender.Down(a); what = a.BaseFriendly() + " (held down)"; }
             else
             {
                 what = Fire(a) + " (repeating)";
@@ -933,7 +1304,7 @@ namespace K2RingRemote
             if (holdMode == HoldMode.KeyDown)
             {
                 Sender.Up(holdAction);
-                Report(holdButton, "release", "let go of " + holdAction.ToFriendly());
+                Report(holdButton, "release", "let go of " + holdAction.BaseFriendly());
             }
             else if (holdMode == HoldMode.Repeat && holdCount > 1) Report(holdButton, "release", "repeated " + holdCount + " times");
         }
@@ -968,7 +1339,7 @@ namespace K2RingRemote
             }
 
             // Hold: the ring button is still pressed after HoldMs.
-            if (down && !holdChecked && enabled && (now - downAt).TotalMilliseconds >= settings.HoldMs)
+            if (down && !holdChecked && enabled && !holding && (now - downAt).TotalMilliseconds >= settings.HoldMs)
             {
                 holdChecked = true;
                 string button = Classify();
@@ -976,6 +1347,12 @@ namespace K2RingRemote
                 ActionSpec a = ActionSpec.Parse(b.Hold);
                 if (a.Kind != ActionKind.None) { FlushPending(); StartHold(button, a, b.Mode); }
             }
+
+            // A Volume Up with no second one soon after: the camera button.
+            if (volUpPending && (now - volUpPendingAt).TotalMilliseconds > VolUpDecideMs) SingleVolumeUp();
+            // An Up / Down hold ends when the ring stops repeating its key.
+            if (mediaHold != null && (now - lastMediaRepeat).TotalMilliseconds > MediaHoldEndMs) EndMediaHold();
+            TickVolume(now);
 
             if (holding && holdMode == HoldMode.Repeat && now >= nextRepeat)
             {
@@ -1044,7 +1421,9 @@ namespace K2RingRemote
                     var info = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
                     long extra = info.dwExtraInfo.ToInt64();
                     bool fromTouch = (extra & 0xFFFFFF00L) == 0xFF515700L;
-                    if (!fromTouch)
+                    // Mouse input made from a touch means a touch reached some window that isn't one of our blockers.
+                    if (fromTouch) { lastTouchLeak = DateTime.Now; leakPt = info.pt; }
+                    else
                         foreach (var a in absorbers)
                             if (a.Visible && a.Contains(info.pt, 3)) a.HideFor(1500);   // real mouse here: get out of its way
                 }
@@ -1089,8 +1468,16 @@ namespace K2RingRemote
 
             if (source == null)
             {
-                var b = Screen.PrimaryScreen.Bounds;
-                rect = new Native.RECT { Left = b.Left, Top = b.Top, Right = b.Right, Bottom = b.Bottom };
+                // Ask Windows directly: Screen.PrimaryScreen caches sizes from whichever thread asked first,
+                // and the (DPI-scaled) UI thread would give 1920x1080 for a 2560x1440 screen.
+                var mi = new Native.MONITORINFO { cbSize = Marshal.SizeOf(typeof(Native.MONITORINFO)) };
+                IntPtr mon = Native.MonitorFromPoint(new Native.POINT { X = 0, Y = 0 }, 1 /*MONITOR_DEFAULTTOPRIMARY*/);
+                if (mon != IntPtr.Zero && Native.GetMonitorInfo(mon, ref mi)) rect = mi.rcMonitor;
+                else
+                {
+                    var b = Screen.PrimaryScreen.Bounds;
+                    rect = new Native.RECT { Left = b.Left, Top = b.Top, Right = b.Right, Bottom = b.Bottom };
+                }
                 source = "primary screen (fallback)";
             }
 
@@ -1126,7 +1513,8 @@ namespace K2RingRemote
     sealed class HidDev
     {
         public string Name;
-        public bool IsRing, HasXY;
+        public bool IsRing, HasXY, IsMedia;
+        public readonly List<ushort> MediaDown = new List<ushort>();   // media usages currently pressed (media part)
         public IntPtr Pp;
         public uint MaxUsages;
         public ushort LinkXY;
@@ -1463,8 +1851,8 @@ namespace K2RingRemote
         readonly TrayUi ui;
         readonly ComboBox cbProfile = new ComboBox();
         readonly CheckBox chkOn = new CheckBox(), chkStartup = new CheckBox();
-        readonly Button[,] cells = new Button[5, 3];
-        readonly ComboBox[] modes = new ComboBox[5];
+        readonly Button[,] cells = new Button[Settings.Buttons.Length, 3];
+        readonly ComboBox[] modes = new ComboBox[Settings.Buttons.Length];
         readonly NumericUpDown nDouble = new NumericUpDown(), nHold = new NumericUpDown(), nRepeat = new NumericUpDown(), nVol = new NumericUpDown();
         readonly ListBox lbLive = new ListBox();
         bool loading;
@@ -1509,18 +1897,19 @@ namespace K2RingRemote
             root.Controls.Add(top);
 
             // --- button grid
-            var grid = new TableLayoutPanel { ColumnCount = 5, RowCount = 6, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 12, 0, 6) };
+            var grid = new TableLayoutPanel { ColumnCount = 5, RowCount = Settings.Buttons.Length + 1, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 12, 0, 6) };
             grid.Controls.Add(Header("Ring button"), 0, 0);
             for (int c = 0; c < 3; c++) grid.Controls.Add(Header(SlotTitles[c]), c + 1, 0);
             grid.Controls.Add(Header("While held"), 4, 0);
             var bold = new Font(Font, FontStyle.Bold);
-            for (int r = 0; r < 5; r++)
+            for (int r = 0; r < Settings.Buttons.Length; r++)
             {
                 grid.Controls.Add(new Label { Text = Settings.Buttons[r], AutoSize = true, Font = bold, Margin = new Padding(0, 10, 14, 0) }, 0, r + 1);
                 for (int c = 0; c < 3; c++)
                 {
                     var b = new Button { Width = 196, Height = 30, TextAlign = ContentAlignment.MiddleLeft, Margin = new Padding(3), Tag = new Point(r, c), UseVisualStyleBackColor = true };
                     b.Click += (s, e) => ShowActionMenu((Button)s);
+                    if (FixedCell(Settings.Buttons[r], c) != null) b.Enabled = false;
                     cells[r, c] = b;
                     grid.Controls.Add(b, c + 1, r + 1);
                 }
@@ -1544,8 +1933,11 @@ namespace K2RingRemote
                 MaximumSize = new Size(820, 0),
                 ForeColor = SystemColors.GrayText,
                 Margin = new Padding(0, 0, 0, 8),
-                Text = "Click an action to pick from the list or record your own key / shortcut. A button that has a double-press action " +
-                       "waits for the double-press window before doing its single press. Hold = keep the ring button pressed. Changes save automatically."
+                Text = "Click an action to pick from the list or record your own key / shortcut, and to set how many times one press sends it. " +
+                       "A button that has a double-press action waits for the double-press window before doing its single press. " +
+                       "Hold = keep the ring button pressed (the ring reports it after about a second). Camera = the side button: it sends " +
+                       "Volume Up, so the app puts the volume back (the volume pop-up may flash) and its action runs half a second later. " +
+                       "While this window is in front the ring's keys are only shown below, not sent. Changes save automatically."
             });
 
             // --- timing
@@ -1640,13 +2032,18 @@ namespace K2RingRemote
                 cbProfile.Items.Clear();
                 foreach (var p in s.Profiles) cbProfile.Items.Add(p.Name);
                 cbProfile.SelectedItem = prof.Name;
-                for (int r = 0; r < 5; r++)
+                for (int r = 0; r < Settings.Buttons.Length; r++)
                 {
-                    ButtonBinding b = prof[Settings.Buttons[r]];
+                    string name = Settings.Buttons[r];
+                    ButtonBinding b = prof[name];
                     for (int c = 0; c < 3; c++)
-                        if (cells[r, c] != recordingCell) SetCellText(cells[r, c], b.Get(c));
+                    {
+                        string fixedText = FixedCell(name, c);
+                        if (fixedText != null) { cells[r, c].Text = fixedText; cells[r, c].ForeColor = SystemColors.GrayText; }
+                        else if (cells[r, c] != recordingCell) SetCellText(cells[r, c], b.Get(c));
+                    }
                     modes[r].SelectedIndex = (int)b.Mode;
-                    modes[r].Enabled = ActionSpec.Parse(b.Hold).Kind != ActionKind.None;
+                    modes[r].Enabled = FixedCell(name, 2) == null && ActionSpec.Parse(b.Hold).Kind != ActionKind.None;
                 }
                 nDouble.Value = Fit(nDouble, s.DoublePressMs);
                 nHold.Value = Fit(nHold, s.HoldMs);
@@ -1667,6 +2064,17 @@ namespace K2RingRemote
             s.RepeatMs = (int)nRepeat.Value;
             s.VolumeSteps = (int)nVol.Value;
             ui.Commit(this);
+        }
+
+        // Cells the ring decides itself (null = the user can set it). Holding Left / Right / Center makes the ring
+        // send Previous / Next / Play-Pause, which Windows acts on directly; the camera button only reports a click.
+        static string FixedCell(string button, int slot)
+        {
+            if (slot == 2 && button == "Left") return "Previous track (ring's own)";
+            if (slot == 2 && button == "Right") return "Next track (ring's own)";
+            if (slot == 2 && button == "Center") return "Play / Pause (ring's own)";
+            if (slot > 0 && button == "Camera") return "(the ring can't do this)";
+            return null;
         }
 
         static void SetCellText(Button b, string spec)
@@ -1715,9 +2123,37 @@ namespace K2RingRemote
                 m.Items.Add(sub);
             }
             m.Items.Add(new ToolStripSeparator());
+
+            // How many times one press sends the action.
+            var rc = (Point)btn.Tag;
+            string cur = ui.Settings.ActiveProfile[Settings.Buttons[rc.X]].Get(rc.Y);
+            ActionSpec ca = ActionSpec.Parse(cur);
+            var times = new ToolStripMenuItem(ca.CanRepeat ? "Times per press" : "Times per press (pick an action first)") { Enabled = ca.CanRepeat };
+            bool listed = false;
+            foreach (int n in new[] { 1, 2, 3, 4, 5, 10 })
+            {
+                int count = n;
+                bool on = ca.Times == n;
+                listed |= on;
+                times.DropDownItems.Add(new ToolStripMenuItem(n == 1 ? "1 (normal)" : n + " times", null,
+                    (s, e) => SetSpec(btn, ActionSpec.WithTimes(cur, count))) { Checked = on });
+            }
+            times.DropDownItems.Add(new ToolStripMenuItem(listed ? "Other number..." : "Other number... (now " + ca.Times + ")", null,
+                (s, e) => AskTimes(btn, cur, ca)) { Checked = !listed });
+            m.Items.Add(times);
+
+            m.Items.Add(new ToolStripSeparator());
             m.Items.Add("Nothing", null, (s, e) => SetSpec(btn, "None"));
             m.Closed += (s, e) => BeginInvoke(new Action(() => m.Dispose()));
             m.Show(btn, new Point(0, btn.Height));
+        }
+
+        void AskTimes(Button btn, string cur, ActionSpec a)
+        {
+            string v = InputBox.Show(this, "Times per press",
+                "How many times should one press send " + a.BaseFriendly() + "? (1 - " + ActionSpec.MaxTimes + ")", a.Times.ToString());
+            int n;
+            if (v != null && int.TryParse(v, out n)) SetSpec(btn, ActionSpec.WithTimes(cur, n));
         }
 
         void StartRecording(Button btn)
@@ -2030,5 +2466,10 @@ namespace K2RingRemote
         [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
         [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value);
         [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
+        [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr mon, ref MONITORINFO mi);
+        [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public int cbSize; public RECT rcMonitor, rcWork; public uint dwFlags; }
     }
 }
